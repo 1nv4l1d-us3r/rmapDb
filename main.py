@@ -78,7 +78,7 @@ if '-v' in sys.argv:
 noOfThreads=5
 if '-t' in sys.argv:
     try:
-        noOfThreads=sys.argv[sys.argv.index('-t')+1]
+        noOfThreads=int(sys.argv[sys.argv.index('-t')+1])
     except:
             pass
 
