@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+
 import sys 
 import socket
 from pymongo.mongo_client import MongoClient
@@ -11,6 +12,7 @@ logging.getLogger("scapy").propagate=False
 from warnings import filterwarnings
 filterwarnings("ignore")
 from scapy.all import *
+import math
 
 class tryAgain(Exception):
     pass
@@ -24,11 +26,10 @@ timeout=1
 socket.setdefaulttimeout(timeout)
 
 uri = "mongodb atlas uri"
-
 # Create a new client and connect to the server
-client = MongoClient(uri)
-db=client['scanningDb']
-collection=db['targets']
+# client = MongoClient(uri)
+# db=client['scanningDb']
+# collection=db['targets']
 
 def connect(ttarget,tport):
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
@@ -74,7 +75,7 @@ verbose=False
 if '-v' in sys.argv:
     verbose=True
 
-noOfThreads=1
+noOfThreads=2
 if '-t' in sys.argv:
     try:
         noOfThreads=int(sys.argv[sys.argv.index('-t')+1])
@@ -94,82 +95,102 @@ if '-i' in sys.argv:
         targets=[x.strip() for x in ips]
     except:
         print('Error reading targets')
-        exit()
     else:
         data=[ {'ip':ip,'ports':ports,'open':[]} for ip in targets]
+        client = MongoClient(uri)
+        db=client['scanningDb']
+        collection=db['targets']
         collection.insert_many(data)
+        client.close()
         print('Enteries inserted')
     exit()
 
 
 
-
-def get_random_doc():
+batch_count=100
+def get_random_docs():
+    client = MongoClient(uri)
+    db=client['scanningDb']
+    collection=db['targets']
     pipeline=[
-        {'$match':{'round_done':{'$ne':True},'ports':{'$ne':[]}}},
-        {'$sample':{'size':1}}
-    ]
+            {'$match':{'round_done':{'$ne':True},'ports':{'$ne':[]}}},
+            {'$sample':{'size':batch_count}},
+            {'$project':{'ip':1,'_id':0,'port':{'$arrayElemAt':['$ports',{'$floor':{'$multiply':[{'$size':'$ports'},{'$rand':{}}]}}]}}}
+        ]
     res=collection.aggregate(pipeline)
-    try:
-        doc=list(res)[0]
-        ports=doc['ports']
-    except:
-        if(len(list(collection.find({'ports':{'$ne':[]}})))==0):
-            raise noTargets
-        else:
-            collection.update_many({},{'$set':{'round_done':False}})
-            raise tryAgain
-    else:
-        return doc['ip'],ports[random.randrange(len(ports))]
+    docs=list(res)
+    if(len(docs)==0):
+        collection.update_many({},{'$set':{'round_done':False}})
+        res2=collection.aggregate(pipeline)
+        docs=list(res2)
+        if(len(docs)==0):
+            global targetsAvailable
+            targetsAvailable=False
+    client.close()
+    return docs
 
 def mark_done(ip,port,open=False):
-    
-    if open:
-        change={'$set':{'round_done':True},'$pull':{'ports':port},'$push':{'open':port}}
-        print(ip,':',port)
-    else:
-        change={'$set':{'round_done':True},'$pull':{'ports':port}}
-    collection.update_many({'ip':ip},change)
+    result_pool[ip]={'port':port,'isOpen':open}
+
+def push_results(results):
+    client = MongoClient(uri)
+    db=client['scanningDb']
+    collection=db['targets']
+
+    for ip in results:
+        port=results[ip]['port']
+        isOpen=results[ip]['port']
+        match={'ip':ip}
+        if(isOpen=='nohost'):
+            update={'$set':{'round_done':True,'noHost':True,'ports':[]}}
+        elif(isOpen==True):
+            update={'$set':{'round_done':True},'$pull':{'ports':port},'$push':{'open':port}}
+        else:
+            update={'$set':{'round_done':True},'$pull':{'ports':port}}
+        collection.update_one(match,update)
+    client.close()
 
 
-
-
-def scan_random():
+def scan_port(ip,port):
     try:
-        ip,port=get_random_doc()
-    except noTargets:
-        global targestAvailable
-        targestAvailable=False
-        return
-    except tryAgain:
-        return
-    else:
         portOpen=scan(ip,port)
-        mark_done(ip,port,portOpen)
-        if verbose:
-            print(ip,':',port,end='\r')
-            return
-        global count
-        count=(count+1)%4
-        print('Scanning',"."*count," "*(5-count),end='\r')
+    except (socket.error, OSError) as e:
+        if(e.errno==113):
+            portOpen='nohost'
+        
+    mark_done(ip,port,portOpen)
+    if verbose:
+        print(ip,':',port,end='\r')
 
 count=0
 targestAvailable=True
+target_pool=get_random_docs()
+result_pool={}
+thread_pool=[]
+last_push=time.time()
+push_delay=0
 while(targestAvailable):
-    thread_pool=[]
-    start_time=time.time()
+    start_time=round(time.time(),3)
+
     for _ in range(noOfThreads):
-        thread=threading.Thread(target=scan_random)
+        if(len(target_pool)==0):
+            target_pool=get_random_docs()
+            for thread in thread_pool:
+                thread.join()
+            thread_pool.clear()
+            push_results(result_pool)
+            result_pool.clear()
+            push_delay=round(time.time()-last_push,1)
+            last_push=time.time()
+        doc=target_pool.pop()
+        thread=threading.Thread(target=scan_port,args=(doc['ip'],doc['port']))
         thread_pool.append(thread)
         thread.start()
         time.sleep(0.01)
-    
-    for thread in thread_pool:
-        thread.join()
+        count=(count+1)%batch_count
+        percent=math.floor((count/batch_count)*20)
+        print('Running','[','>'*percent,' '*(20-percent),']',push_delay,'s / '+str(batch_count)+' ports',end='\r')
     now=time.time()
     diff=round(start_time+1-now,3)
-    try:
-        time.sleep(diff)    # sleeps the rest of time left in a second  
-    except:
-        pass
-    
+    if(diff>0):
+        time.sleep(diff)    # sleeps the rest of time left in a second   
